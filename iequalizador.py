@@ -1,104 +1,140 @@
 import numpy as np
-from scipy.signal import butter, filtfilt
-import soundfile as sf
+import pyaudio
+import sys
+from scipy.signal import butter, lfilter, lfilter_zi
+from numba import jit
 
 # =========================================================
-# 1. MÓDULO DE FILTRAGEM BÁSICA (HPF E LPF)
+# 1. CONFIGURAÇÕES TÉCNICAS (MODIFICÁVEIS)
 # =========================================================
-def aplicar_hpf_lpf(sinal, fs, hpf_freq, lpf_freq):
-    """
-    Aplica filtros Passa-Alta (Corta graves) e Passa-Baixa (Corta agudos).
-    Utiliza o design de filtro Butterworth para curvas suaves [5, 7].
-    """
-    # High-Pass Filter (Filtro Passa-Alta)
-    b_h, a_h = butter(4, hpf_freq / (0.5 * fs), btype='high')
-    sinal = filtfilt(b_h, a_h, sinal)
-    
-    # Low-Pass Filter (Filtro Passa-Baixa)
-    b_l, a_l = butter(4, lpf_freq / (0.5 * fs), btype='low')
-    sinal = filtfilt(b_l, a_l, sinal)
-    
-    return sinal
+CHUNK = 512          # Latência de buffer (~11.6ms @ 44.1kHz)
+FS = 44100           # Taxa de amostragem
+F_TARGET = 3200.0    # Frequência central do EQ Dinâmico
+Q = 1.2              # Fator de qualidade (largura da banda)
+THRESHOLD_DB = -18.0 # Limite de atuação
+RATIO = 4.0          # Compressão (4:1)
+ATK_MS = 5.0         # Ataque rápido para transientes
+REL_MS = 60.0        # Release musical
 
 # =========================================================
-# 2. MÓDULO DO EQUALIZADOR DINÂMICO
+# 2. ENGINE DE PROCESSAMENTO ULTRA-RÁPIDA (NUMBA)
 # =========================================================
-def equalizador_dinamico(sinal, fs, freq_alvo, largura_banda, threshold_linear, attack_ms, release_ms, max_reducao=0.1):
+@jit(nopython=True, cache=True)
+def engine_dsp_pro(abs_sq, chunk_size, c_rms, c_atk, c_rel, threshold_db, ratio, env_in, g_in):
     """
-    Aplica a redução de ganho APENAS quando a frequência alvo passar do threshold.
+    Processamento de ganho dinâmico em nível de código de máquina.
+    Usa propriedades logarítmicas para evitar raízes quadradas pesadas.
     """
-    # 1. Separa o áudio em duas faixas usando processamento paralelo [8]
-    low_cut = freq_alvo - (largura_banda / 2)
-    high_cut = freq_alvo + (largura_banda / 2)
+    gr_linear = np.ones(chunk_size, dtype=np.float32)
+    curr_e = env_in
+    curr_g = g_in
     
-    # Isola a frequência problemática (Bandpass) [3, 9]
-    b_bp, a_bp = butter(4, [low_cut / (0.5 * fs), high_cut / (0.5 * fs)], btype='bandpass')
-    banda_alvo = filtfilt(b_bp, a_bp, sinal)
-    
-    # Isola o restante do áudio que não será alterado (Bandstop) [10]
-    b_bs, a_bs = butter(4, [low_cut / (0.5 * fs), high_cut / (0.5 * fs)], btype='bandstop')
-    resto_audio = filtfilt(b_bs, a_bs, sinal)
-    
-    # 2. Configurações de Dinâmica (Envelope Follower e Fatores de Tempo) [4]
-    # Converte os tempos de milissegundos para fatores do tamanho do buffer [11]
-    attack_factor = np.exp(-1.0 / (fs * (attack_ms / 1000.0)))
-    release_factor = np.exp(-1.0 / (fs * (release_ms / 1000.0)))
-    
-    ganho_aplicado = np.ones_like(banda_alvo)
-    ganho_atual = 1.0
-    env_atual = 0.0
-    
-    # 3. Analisa amostra por amostra (Sample by Sample)
-    for n in range(len(banda_alvo)):
-        # Calcula o Envelope: lê as ondas e ignora quedas abruptas [4]
-        env_atual = max(abs(banda_alvo[n]), env_atual * release_factor)
+    for i in range(chunk_size):
+        # Suavização RMS (Energia média)
+        curr_e = c_rms * curr_e + (1.0 - c_rms) * abs_sq[i]
         
-        # Calcula o Ganho Alvo (Comprime/Tira ganho se ultrapassar o Threshold) [11]
-        if env_atual > threshold_linear:
-            target_gain = threshold_linear / env_atual
-            target_gain = max(target_gain, max_reducao) # Limita para não silenciar 100%
-        else:
-            target_gain = 1.0 # Deixa intacto se estiver abaixo do limite
+        # Conversão direta p/ dB (10 * log10(x^2) é o mesmo que 20 * log10(x))
+        env_db = 10.0 * np.log10(curr_e + 1e-12)
+        
+        # Cálculo do ganho alvo
+        g_target = 1.0
+        if env_db > threshold_db:
+            # Curva de transferência padrão de compressão
+            g_target = 10.0**((threshold_db - env_db) * (1.0 - 1.0/ratio) / 20.0)
             
-        # Suaviza a mudança de ganho aplicando os fatores de Attack e Release [11]
-        ganho_atual = ganho_atual * attack_factor + target_gain * (1.0 - attack_factor)
-        ganho_aplicado[n] = ganho_atual
+        # Balística Assimétrica (Ataque e Release suaves)
+        coeff = c_atk if g_target < curr_g else c_rel
+        curr_g = coeff * curr_g + (1.0 - coeff) * g_target
+        gr_linear[i] = curr_g
+        
+    return gr_linear, curr_e, curr_g
 
-    # 4. Multiplica o novo ganho na banda isolada e mistura com o restante do áudio original [8, 12]
-    banda_controlada = banda_alvo * ganho_aplicado
-    sinal_final = resto_audio + banda_controlada
+# =========================================================
+# 3. SETUP DE FILTROS E ESTADOS
+# =========================================================
+nyq = 0.5 * FS
+bw = F_TARGET / Q
+low = max(0.001, (F_TARGET - bw/2) / nyq)
+high = min(0.999, (F_TARGET + bw/2) / nyq)
+b_bp, a_bp = butter(2, [low, high], btype='bandpass')
+
+# Estados persistentes para evitar estalos (Pulo do Gato)
+zi_banda = lfilter_zi(b_bp, a_bp)
+curr_env = np.float64(0.0)
+last_g = np.float64(1.0)
+
+# Coeficientes de tempo
+def get_c(ms): return np.float64(np.exp(-1.0 / (FS * (ms / 1000.0))))
+c_atk, c_rel, c_rms = get_c(ATK_MS), get_c(REL_MS), get_c(20.0)
+
+# =========================================================
+# 4. CALLBACK DE ÁUDIO REAL-TIME
+# =========================================================
+def callback(in_data, frame_count, time_info, status):
+    global zi_banda, curr_env, last_g
     
-    return sinal_final
+    # Converte buffer para array
+    x = np.frombuffer(in_data, dtype=np.float32).copy()
+    
+    # Isola a banda (Filtro de fase estável)
+    banda, zi_banda = lfilter(b_bp, a_bp, x, zi=zi_banda)
+    
+    # Roda a Engine Numba
+    gr, curr_env, last_g = engine_dsp_pro(
+        banda**2, CHUNK, c_rms, c_atk, c_rel, 
+        THRESHOLD_DB, RATIO, curr_env, last_g
+    )
+    
+    # Recombinação e Limiter de segurança simples
+    final = x + (banda * (gr - 1.0))
+    
+    # Peak monitor (Opcional)
+    if np.max(np.abs(final)) > 1.0:
+        final /= np.max(np.abs(final))
+        
+    return (final.astype(np.float32).tobytes(), pyaudio.paContinue)
 
 # =========================================================
-# 3. EXECUTANDO A FERRAMENTA NA MÚSICA
+# 5. INICIALIZAÇÃO E SELEÇÃO DE HARDWARE
 # =========================================================
+p = pyaudio.PyAudio()
 
-# Carrega o áudio e a taxa de amostragem usando a biblioteca soundfile [6, 13]
-# O áudio precisa estar normalizado entre -1.0 e 1.0
-sinal, fs = sf.read("seu_audio.wav")
+print("\n--- DISPOSITIVOS DISPONÍVEIS ---")
+for i in range(p.get_device_count()):
+    info = p.get_device_info_by_index(i)
+    print(f"ID {i}: {info['name']} (Inputs: {info['maxInputChannels']})")
 
-# Se for estéreo, processamos apenas o canal esquerdo por simplicidade neste exemplo.
-if len(sinal.shape) > 1:
-    sinal = sinal[:, 0]
+# Selecione os IDs aqui baseado no print acima
+IN_ID = 1  # Exemplo: Placa USB
+OUT_ID = 2 
 
-# --- PASSO A: Aplicar Limpeza (HPF e LPF do canal) ---
-# Corta sub-graves abaixo de 80Hz e ruídos agudos acima de 15000Hz
-sinal_limpo = aplicar_hpf_lpf(sinal, fs, hpf_freq=80, lpf_freq=15000)
+print("\nCompilando Engine Numba (Warm-up)...")
+_ = engine_dsp_pro(np.zeros(CHUNK, dtype=np.float32), CHUNK, c_rms, c_atk, c_rel, THRESHOLD_DB, RATIO, 0.0, 1.0)
 
-# --- PASSO B: Aplicar Equalizador Dinâmico Inteligente ---
-# Vamos tirar o ganho APENAS da frequência irritante de 4000 Hz, quando ela gritar acima de 0.2 de amplitude.
-sinal_processado = equalizador_dinamico(
-    sinal=sinal_limpo,
-    fs=fs,
-    freq_alvo=4000,          # Centro em 4kHz (agudo incômodo)
-    largura_banda=1000,      # Atinge a região de 3500Hz a 4500Hz
-    threshold_linear=0.2,    # Limite matemático (substitui o limite em dBFS)
-    attack_ms=10,            # Age em 10 milissegundos
-    release_ms=50,           # Solta o filtro em 50 milissegundos
-    max_reducao=0.3          # Reduz até no máximo 30% do volume original da faixa
-)
+try:
+    stream = p.open(format=pyaudio.paFloat32,
+                    channels=1,
+                    rate=FS,
+                    input=True,
+                    output=True,
+                    input_device_index=IN_ID,
+                    output_device_index=OUT_ID,
+                    frames_per_buffer=CHUNK,
+                    stream_callback=callback)
 
-# Exporta o áudio processado e inteligenteizado final
-sf.write("audio_inteligente_final.wav", sinal_processado, fs)
-print("Processamento concluído com sucesso!")
+    print(f"\n>> ENGINE ATIVA EM {F_TARGET}Hz")
+    print(">> Pressione Ctrl+C para encerrar...")
+    
+    stream.start_stream()
+    while stream.is_active():
+        pass
+
+except KeyboardInterrupt:
+    print("\nEncerrando...")
+except Exception as e:
+    print(f"\nErro: {e}")
+finally:
+    if 'stream' in locals():
+        stream.stop_stream()
+        stream.close()
+    p.terminate()
